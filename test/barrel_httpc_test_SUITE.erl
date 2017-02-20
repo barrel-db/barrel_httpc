@@ -46,7 +46,8 @@
   change_deleted/1,
   change_since_include_doc/1,
   change_since_many/1,
-  revsdiff/1
+  revsdiff/1,
+  system_docs/1
 ]).
 
 all() ->
@@ -104,6 +105,12 @@ db_ops(_Config) ->
   ok = barrel_httpc:delete_database(<<"http://localhost:7080/dbs/testdb2">>),
   {error, not_found} = barrel_httpc:connect(<<"http://localhost:7080/dbs/testdb2">>),
   [<<"source">>, <<"testdb">>] = barrel_httpc:database_names(<<"http://localhost:7080">>),
+  DbUrl = <<"http://localhost:7080/dbs/testdb2">>,
+  {ok, DbUrl} = barrel_httpc:create_database(
+    <<"http://localhost:7080">>, #{ <<"database_id">> => <<"testdb2">>}
+  ),
+  [<<"source">>, <<"testdb">>, <<"testdb2">>] = barrel_httpc:database_names(<<"http://localhost:7080">>),
+  ok = barrel_httpc:delete_database(<<"http://localhost:7080/dbs/testdb2">>),
   ok.
 
 basic_op(Config) ->
@@ -421,6 +428,15 @@ change_since_many(Config) ->
         {20, #{<<"id">> := <<"doc20">>}}]} = barrel_httpc:changes_since(db(Config), 19, Fun, [], []),
   {ok, []} = barrel_httpc:changes_since(db(Config), 21, Fun, [], []),
   ok.
+
+system_docs(_Config) ->
+  Doc = #{<<"v">> => 1},
+  ok = barrel_httpc:put_system_doc(<<"testdb">>, <<"a">>, Doc),
+  {ok, Doc} = barrel_db:get_system_doc(<<"testdb">>, <<"a">>),
+  ok = barrel_db:delete_system_doc(<<"testdb">>, <<"a">>),
+  {error, not_found} = barrel_db:get_system_doc(<<"testdb">>, <<"a">>),
+  ok.
+
 
 %% internal
 

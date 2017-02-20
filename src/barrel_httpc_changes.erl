@@ -32,9 +32,24 @@
   system_terminate/4
 ]).
 
+-type listener_options() :: #{
+  since => non_neg_integer(),
+  mode => binary | sse,
+  include_doc => true | false,
+  history => true | false,
+  change_cb => fun( (barrel_peer:change()) -> ok )
+}.
+
+-export_type([listener_options/0]).
+
 -define(TIMEOUT, 5000).
 
-
+%% fetch all changes received by a listener à that time.
+%% Only useful when no changes callback is given.
+%% Otherwise the list will always be empty.
+-spec changes(ListenerPid) -> Changes when
+  ListenerPid :: pid(),
+  Changes :: [barrel_httpc:change()].
 changes(FeedPid) ->
   Tag = make_ref(),
   MRef = erlang:monitor(process, FeedPid),
@@ -47,10 +62,31 @@ changes(FeedPid) ->
     exit(timeout)
   end.
 
+%% @doc start a change listener on the database.
+%% This function create a process that will listen on the changes feed API.
+%% If not callback is given, changes are queued in the process and need
+%% to be fetched using the `fetch_changes' function. When a callback is given,
+%% a change is passed to the function, no state is kept in the process.
+%% a change given to the callback or in the list is under the following form
+%% #{
+%%   <<"id">> := binary(),  % id of the document updated
+%%   <<"seq">> := non_neg_integer(), % sequence of the change
+%%   <<"changes">> => [revid(], % revision id of the change or
+%%                              % the full history if history is true (from last to first),
+%%   <<"deleted">> => true | false % present if deleted
+%%}
+-spec start_link(Conn, ListenerOptions) -> Res when
+  Conn :: barrel_httpc:conn(),
+  ListenerOptions :: listener_options(),
+  ListenerPid :: pid(),
+  Res :: {ok, ListenerPid} | {error, any()}.
 start_link(Conn, Options) ->
   proc_lib:start_link(?MODULE, init_feed, [self(), Conn, Options]).
 
-
+%% @doc stop a change listener
+-spec stop(ListenerPid) -> Res when
+  ListenerPid :: pid(),
+  Res :: ok.
 stop(FeedPid) ->
   MRef = erlang:monitor(process, FeedPid),
   FeedPid ! stop,
@@ -58,6 +94,8 @@ stop(FeedPid) ->
     {'DOWN', MRef, _, _, _} -> ok
   end.
 
+%% @doc parse a binary change fetched when start_listener mod is binary
+-spec parse_change(binary()) -> barrel_httpc:change().
 parse_change(ChangeBin) ->
   Lines = binary:split(ChangeBin, <<"\n">>, [global]),
   lists:foldl(
@@ -73,6 +111,8 @@ parse_change(ChangeBin) ->
     Lines
   ).
 
+
+
 init_feed(Parent, Conn, Options) ->
   Headers = case maps:get(since, Options, 0) of
     0 -> 
@@ -87,7 +127,6 @@ init_feed(Parent, Conn, Options) ->
   proc_lib:init_ack(Parent, {ok, self()}),
   case hackney:request(<<"GET">>, Url, Headers, <<>>, ReqOpts) of
     {ok, Ref} ->
-      io:format("wait response~n", []),
       wait_response(Parent, Ref, Options);
     Error ->
       lager:error("~s: ~p~n", [?MODULE_STRING, Error]),
@@ -108,20 +147,24 @@ wait_response(Parent, Ref, Options) ->
       wait_changes(State);
     {hackney_response, Ref, {status, 404, _}} ->
       lager:error("~s not_found ~n", [?MODULE_STRING]),
+      cleanup(Ref, not_found),
       exit(not_found);
     {hackney_response, Ref, {status, Status, Reason}} ->
       lager:error(
         "~s request bad status ~p(~p)~n",
         [?MODULE_STRING, Status, Reason]
       ),
+      cleanup(Ref, {http_error, Status, Reason}),
       exit({http_error, Status, Reason});
     {hackney_response, Ref, {error, Reason}} ->
       lager:error(
         "~s hackney error: ~p~n",
         [?MODULE_STRING, Reason]
       ),
+      cleanup(Ref, Reason),
       exit(Reason())
   after ?TIMEOUT ->
+    cleanup(Ref, timeout),
     exit(timeout)
   end.
 
@@ -133,9 +176,9 @@ wait_changes(State = #{ parent := Parent, ref := Ref }) ->
       Pid ! {changes, Tag, Events},
       wait_changes(NewState);
     {hackney_response, Ref, {headers, _Headers}} ->
-     
       wait_changes(State);
     {hackney_response, Ref, done} ->
+      cleanup(State, "remote stopped"),
       exit(normal);
     {hackney_response, Ref, Data} when is_binary(Data) ->
       decode_data(Data, State);
@@ -144,8 +187,10 @@ wait_changes(State = #{ parent := Parent, ref := Ref }) ->
         "~s hackney error: ~p~n",
         [?MODULE_STRING, Error]
       ),
+      cleanup(State, Error),
       exit(Error);
     stop ->
+      cleanup(State, "listener stopped"),
       exit(normal);
     {system, From, Request} ->
       sys:handle_system_msg(
@@ -153,6 +198,7 @@ wait_changes(State = #{ parent := Parent, ref := Ref }) ->
         {wait_changes, State})
   after ?TIMEOUT ->
     lager:error("~s timeout: ~n", [?MODULE_STRING]),
+    cleanup(State, timeout),
     exit(timeout)
   end.
 
@@ -171,6 +217,15 @@ system_terminate(Reason, _, _, #{ ref := Ref }) ->
 
 system_code_change(Misc, _, _, _) ->
   {ok, Misc}.
+
+
+cleanup(#{ ref := Ref }, Reason) ->
+  cleanup(Ref, Reason);
+cleanup(Ref, Reason) ->
+  lager:info("closing change feed connection: ~p", [Reason]),
+  (catch hackney:close(Ref)),
+  
+  ok.
 
 
 get_changes(State = #{ changes := Q }) ->
