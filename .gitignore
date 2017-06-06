@@ -6,15 +6,12 @@ _*
 *.plt
 *.swp
 *.swo
-.idea
 .erlang.cookie
 ebin
 log
 erl_crash.dump
 .rebar
-log
 logs
 _build
-docs
-data
-*.iml
+.idea
+rebar3.crashdump
